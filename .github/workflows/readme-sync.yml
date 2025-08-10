@@ -4,66 +4,103 @@ on:
   workflow_call:
     inputs:
       concept_doi:
-        required: true
+        description: "Zenodo concept DOI (e.g. 10.5281/zenodo.xxxxxxx); optional"
+        required: false
         type: string
     secrets:
       ZENODO_TOKEN:
         required: false
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: "3.x"
 
-      - name: Prepare context (links + timestamp + OSF slug)
+      # 准备渲染上下文：links.json + 时间戳 + OSF slug + concept_doi
+      - name: Prepare context (links + timestamp + OSF slug + concept doi)
+        id: ctx
+        shell: bash
         run: |
+          set -e
           python - <<'PY'
-          import json, re
+          import json, re, os
           from pathlib import Path
           from datetime import datetime
 
           root = Path('.')
-          data = json.loads((root/'links.json').read_text('utf-8')) if (root/'links.json').exists() else {}
+          data = {}
+          p = root / 'links.json'
+          if p.exists():
+              data = json.loads(p.read_text('utf-8'))
 
-          # 时间戳
-          data['last_updated'] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+          # defaults
+          data.setdefault('title', '')
+          data.setdefault('subtitle', '')
+          data.setdefault('repo_url', '')
+          data.setdefault('osf_url', '')
+          data.setdefault('zenodo_concept_doi', '')
 
-          # OSF 短码（徽章用）
+          # timestamp
+          data['last_updated'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+          # osf slug (badge 用)
           m = re.search(r'osf\.io/([a-z0-9]+)', data.get('osf_url',''), re.I)
           data['osf_slug'] = (m.group(1).upper() if m else 'RECORD')
 
-          # 兜底字段
-          for k in ('title','subtitle','repo_url','zenodo_concept_doi'):
-              data.setdefault(k, '')
+          # concept doi: links.json 优先，其次 inputs
+          input_concept = os.environ.get('INPUT_CONCEPT_DOI', '').strip()
+          if not data.get('zenodo_concept_doi'):
+              data['zenodo_concept_doi'] = input_concept
 
-          (root/'_render_context.json').write_text(json.dumps(data, ensure_ascii=False), 'utf-8')
-          print("Context ready.")
+          (root / '_render_context.json').write_text(
+              json.dumps(data, ensure_ascii=False), 'utf-8'
+          )
+          print('Context ready:', data)
           PY
 
+      # 尝试获取最新的 version DOI（失败不报错）
       - name: Fetch latest Zenodo version DOI (best-effort)
+        id: zen
+        shell: bash
         env:
-          CONCEPT: ${{ inputs.concept_doi }}
+          INPUT_CONCEPT_DOI: ${{ inputs.concept_doi }}
         run: |
           set -e
-          LATEST=$(curl -s "https://zenodo.org/api/records/?q=conceptdoi:${CONCEPT}&sort=mostrecent&size=1" | jq -r '.hits.hits[0].doi // empty')
-          if [ -n "$LATEST" ]; then
-            jq --arg v "$LATEST" '. + {zenodo_latest_doi:$v}' _render_context.json > _ctx.json && mv _ctx.json _render_context.json
-            echo "Latest DOI: $LATEST"
+          concept=$(jq -r '.zenodo_concept_doi // empty' _render_context.json 2>/dev/null || echo "")
+          if [ -z "$concept" ]; then
+            concept="${INPUT_CONCEPT_DOI}"
+          fi
+
+          latest=""
+          if [ -n "$concept" ]; then
+            # API 可能变动/失败：任何一步失败都不让 workflow 挂
+            resp=$(curl -fsSL "https://zenodo.org/api/records?q=conceptdoi:${concept}&sort=mostrecent&size=1" || echo "{}")
+            latest=$(printf '%s' "$resp" | jq -r '.hits.hits[0].metadata.doi // .hits.hits[0].doi // empty' 2>/dev/null || echo "")
+          fi
+
+          if [ -n "$latest" ]; then
+            jq --arg v "$latest" '. + {zenodo_latest_doi:$v}' _render_context.json > _ctx.json && mv _ctx.json _render_context.json
+            echo "latest=$latest" >> "$GITHUB_OUTPUT"
+            echo "Latest DOI: $latest"
           else
             echo "Latest DOI not found; keep concept DOI only."
           fi
 
       - name: Render README from template + CONTENT.md
+        shell: bash
         run: |
+          set -e
           python - <<'PY'
           import json, re
           from pathlib import Path
@@ -76,15 +113,16 @@ jobs:
           ctx['custom_content'] = custom
 
           def render(t, kv):
-              for k,v in kv.items():
+              for k, v in kv.items():
                   t = re.sub(r"{{\s*"+re.escape(k)+r"\s*}}", v if v is not None else '', t)
               return t
 
           (root/'README.md').write_text(render(tpl, ctx), 'utf-8')
-          print("README.md updated.")
+          print('README.md updated.')
           PY
 
       - name: Commit README.md if changed
+        shell: bash
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
