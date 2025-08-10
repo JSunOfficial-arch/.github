@@ -1,21 +1,14 @@
-name: README Auto Sync
+name: Reusable README Sync
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - links.json
-      - README.tpl.md
-      - CONTENT.md
-  workflow_dispatch:
+  workflow_call: {}   # 允许被其它仓库调用
 
 permissions:
-  contents: write
+  contents: write     # 允许提交 README.md
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +17,7 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Render README from template
+      - name: Prepare context (links + timestamp + OSF slug)
         run: |
           python - <<'PY'
           import json, re
@@ -32,46 +25,64 @@ jobs:
           from datetime import datetime
 
           root = Path('.')
-
-          # 读取 links.json（可空）
           data = {}
           p = root/'links.json'
           if p.exists():
               data = json.loads(p.read_text('utf-8'))
-
-          # 兜底字段（模板中用到的键）
-          data.setdefault('title', '')
-          data.setdefault('subtitle', '')
-          data.setdefault('repo_url', '')
-          data.setdefault('osf_url', '')
-          data.setdefault('zenodo_concept_doi', '')
-
-          # OSF 徽章短码（没有就显示 RECORD）
-          m = re.search(r'osf\.io/([a-z0-9]+)', data.get('osf_url',''), re.I)
-          data['osf_slug'] = (m.group(1).upper() if m else 'RECORD')
-
+          # 兜底键
+          for k in ('title','subtitle','repo_url','osf_url','zenodo_concept_doi'):
+              data.setdefault(k, '')
           # 时间戳
           data['last_updated'] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+          # OSF slug
+          m = re.search(r'osf\.io/([a-z0-9]+)', data.get('osf_url',''), re.I)
+          data['osf_slug'] = (m.group(1).upper() if m else 'RECORD')
+          Path('_render_context.json').write_text(json.dumps(data, ensure_ascii=False), 'utf-8')
+          PY
 
-          # 自定义正文（可选）
-          custom = (root/'CONTENT.md').read_text('utf-8') if (root/'CONTENT.md').exists() else ''
-          data['custom_content'] = custom
+      - name: Fetch latest Zenodo version DOI (best-effort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONCEPT=$(jq -r '.zenodo_concept_doi // empty' _render_context.json)
+          if [ -n "$CONCEPT" ]; then
+            LATEST=$(curl -s "https://zenodo.org/api/records/?q=conceptdoi:${CONCEPT}&sort=mostrecent&size=1" \
+                     | jq -r '.hits.hits[0].doi // empty')
+            if [ -n "$LATEST" ]; then
+              jq --arg v "$LATEST" '. + {zenodo_latest_doi:$v}' _render_context.json > _ctx.json && mv _ctx.json _render_context.json
+              echo "Latest DOI: $LATEST"
+            else
+              echo "No latest DOI found. Continue."
+            fi
+          else
+            echo "No concept DOI. Skip fetching latest DOI."
+          fi
 
-          # 渲染
-          tpl = (root/'README.tpl.md').read_text('utf-8') if (root/'README.tpl.md').exists() else ''
+      - name: Render README from template + CONTENT.md
+        run: |
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          root = Path('.')
+          ctx = json.loads((root/'_render_context.json').read_text('utf-8'))
+          tpl = (root/'README.tpl.md').read_text('utf-8') if (root/'README.tpl.md').exists() else ""
+          custom = (root/'CONTENT.md').read_text('utf-8') if (root/'CONTENT.md').exists() else ""
+          ctx['custom_content'] = custom
+
           def render(t, kv):
               for k, v in kv.items():
-                  t = re.sub(r"{{\s*"+re.escape(k)+r"\s*}}", v if v is not None else '', t)
+                  t = re.sub(r"{{\s*"+re.escape(k)+r"\s*}}", (v or ''), t)
               return t
 
-          (root/'README.md').write_text(render(tpl, data), 'utf-8')
+          (root/'README.md').write_text(render(tpl, ctx), 'utf-8')
           print("README.md updated.")
           PY
 
-      - name: Commit README if changed
+      - name: Commit README.md if changed
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md || true
           git commit -m "chore: auto-update README from template" || echo "No changes"
-          git push || true
+          git push || echo "Push skipped (no permission on PR runs)"
