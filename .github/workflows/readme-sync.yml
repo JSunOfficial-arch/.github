@@ -13,26 +13,65 @@ permissions:
   contents: write
 
 jobs:
-  ctx:
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      concept_doi: ${{ steps.meta.outputs.concept_doi }}
+
     steps:
       - uses: actions/checkout@v4
-      - id: meta
-        shell: bash
-        run: |
-          set -e
-          concept=$(jq -r '.zenodo_concept_doi // empty' links.json 2>/dev/null || echo "")
-          if [ -z "$concept" ]; then
-            echo "zenodo_concept_doi is empty in links.json" >&2
-            exit 1
-          fi
-          echo "concept_doi=$concept" >> "$GITHUB_OUTPUT"
 
-  build:
-    needs: ctx
-    uses: JSunOfficial-arch/.github/.github/workflows/readme-sync.yml@main   # ← 用组织级工作流
-    with:
-      concept_doi: ${{ needs.ctx.outputs.concept_doi }}
-    secrets: inherit
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Render README from template
+        run: |
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          from datetime import datetime
+
+          root = Path('.')
+
+          # 读取 links.json（可空）
+          data = {}
+          p = root/'links.json'
+          if p.exists():
+              data = json.loads(p.read_text('utf-8'))
+
+          # 兜底字段（模板中用到的键）
+          data.setdefault('title', '')
+          data.setdefault('subtitle', '')
+          data.setdefault('repo_url', '')
+          data.setdefault('osf_url', '')
+          data.setdefault('zenodo_concept_doi', '')
+
+          # OSF 徽章短码（没有就显示 RECORD）
+          m = re.search(r'osf\.io/([a-z0-9]+)', data.get('osf_url',''), re.I)
+          data['osf_slug'] = (m.group(1).upper() if m else 'RECORD')
+
+          # 时间戳
+          data['last_updated'] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+          # 自定义正文（可选）
+          custom = (root/'CONTENT.md').read_text('utf-8') if (root/'CONTENT.md').exists() else ''
+          data['custom_content'] = custom
+
+          # 渲染
+          tpl = (root/'README.tpl.md').read_text('utf-8') if (root/'README.tpl.md').exists() else ''
+          def render(t, kv):
+              for k, v in kv.items():
+                  t = re.sub(r"{{\s*"+re.escape(k)+r"\s*}}", v if v is not None else '', t)
+              return t
+
+          (root/'README.md').write_text(render(tpl, data), 'utf-8')
+          print("README.md updated.")
+          PY
+
+      - name: Commit README if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md || true
+          git commit -m "chore: auto-update README from template" || echo "No changes"
+          git push || true
