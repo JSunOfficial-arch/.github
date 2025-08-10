@@ -1,131 +1,38 @@
-name: Reusable README Sync
+name: README Auto Sync
 
 on:
-  workflow_call:
-    inputs:
-      concept_doi:
-        description: "Zenodo concept DOI (e.g. 10.5281/zenodo.xxxxxxx); optional"
-        required: false
-        type: string
-    secrets:
-      ZENODO_TOKEN:
-        required: false
+  push:
+    branches: [main]
+    paths:
+      - links.json
+      - README.tpl.md
+      - CONTENT.md
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  ctx:
     runs-on: ubuntu-latest
-
+    outputs:
+      concept_doi: ${{ steps.meta.outputs.concept_doi }}
     steps:
-      - name: Checkout caller repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      # 准备渲染上下文：links.json + 时间戳 + OSF slug + concept_doi
-      - name: Prepare context (links + timestamp + OSF slug + concept doi)
-        id: ctx
+      - uses: actions/checkout@v4
+      - id: meta
         shell: bash
         run: |
           set -e
-          python - <<'PY'
-          import json, re, os
-          from pathlib import Path
-          from datetime import datetime
-
-          root = Path('.')
-          data = {}
-          p = root / 'links.json'
-          if p.exists():
-              data = json.loads(p.read_text('utf-8'))
-
-          # defaults
-          data.setdefault('title', '')
-          data.setdefault('subtitle', '')
-          data.setdefault('repo_url', '')
-          data.setdefault('osf_url', '')
-          data.setdefault('zenodo_concept_doi', '')
-
-          # timestamp
-          data['last_updated'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-
-          # osf slug (badge 用)
-          m = re.search(r'osf\.io/([a-z0-9]+)', data.get('osf_url',''), re.I)
-          data['osf_slug'] = (m.group(1).upper() if m else 'RECORD')
-
-          # concept doi: links.json 优先，其次 inputs
-          input_concept = os.environ.get('INPUT_CONCEPT_DOI', '').strip()
-          if not data.get('zenodo_concept_doi'):
-              data['zenodo_concept_doi'] = input_concept
-
-          (root / '_render_context.json').write_text(
-              json.dumps(data, ensure_ascii=False), 'utf-8'
-          )
-          print('Context ready:', data)
-          PY
-
-      # 尝试获取最新的 version DOI（失败不报错）
-      - name: Fetch latest Zenodo version DOI (best-effort)
-        id: zen
-        shell: bash
-        env:
-          INPUT_CONCEPT_DOI: ${{ inputs.concept_doi }}
-        run: |
-          set -e
-          concept=$(jq -r '.zenodo_concept_doi // empty' _render_context.json 2>/dev/null || echo "")
+          concept=$(jq -r '.zenodo_concept_doi // empty' links.json 2>/dev/null || echo "")
           if [ -z "$concept" ]; then
-            concept="${INPUT_CONCEPT_DOI}"
+            echo "zenodo_concept_doi is empty in links.json" >&2
+            exit 1
           fi
+          echo "concept_doi=$concept" >> "$GITHUB_OUTPUT"
 
-          latest=""
-          if [ -n "$concept" ]; then
-            # API 可能变动/失败：任何一步失败都不让 workflow 挂
-            resp=$(curl -fsSL "https://zenodo.org/api/records?q=conceptdoi:${concept}&sort=mostrecent&size=1" || echo "{}")
-            latest=$(printf '%s' "$resp" | jq -r '.hits.hits[0].metadata.doi // .hits.hits[0].doi // empty' 2>/dev/null || echo "")
-          fi
-
-          if [ -n "$latest" ]; then
-            jq --arg v "$latest" '. + {zenodo_latest_doi:$v}' _render_context.json > _ctx.json && mv _ctx.json _render_context.json
-            echo "latest=$latest" >> "$GITHUB_OUTPUT"
-            echo "Latest DOI: $latest"
-          else
-            echo "Latest DOI not found; keep concept DOI only."
-          fi
-
-      - name: Render README from template + CONTENT.md
-        shell: bash
-        run: |
-          set -e
-          python - <<'PY'
-          import json, re
-          from pathlib import Path
-
-          root = Path('.')
-          ctx = json.loads((root/'_render_context.json').read_text('utf-8'))
-
-          tpl = (root/'README.tpl.md').read_text('utf-8') if (root/'README.tpl.md').exists() else ""
-          custom = (root/'CONTENT.md').read_text('utf-8') if (root/'CONTENT.md').exists() else ""
-          ctx['custom_content'] = custom
-
-          def render(t, kv):
-              for k, v in kv.items():
-                  t = re.sub(r"{{\s*"+re.escape(k)+r"\s*}}", v if v is not None else '', t)
-              return t
-
-          (root/'README.md').write_text(render(tpl, ctx), 'utf-8')
-          print('README.md updated.')
-          PY
-
-      - name: Commit README.md if changed
-        shell: bash
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md || true
-          git commit -m "chore: auto-update README from template" || echo "No changes"
-          git push || echo "Push skipped"
+  build:
+    needs: ctx
+    uses: JSunOfficial-arch/.github/.github/workflows/readme-sync.yml@main   # ← 用组织级工作流
+    with:
+      concept_doi: ${{ needs.ctx.outputs.concept_doi }}
+    secrets: inherit
