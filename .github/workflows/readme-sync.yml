@@ -41,22 +41,44 @@ jobs:
           PY
 
       - name: Fetch latest Zenodo version DOI (best-effort)
-        shell: bash
-        run: |
-          set -euo pipefail
-          CONCEPT=$(jq -r '.zenodo_concept_doi // empty' _render_context.json)
-          if [ -n "$CONCEPT" ]; then
-            LATEST=$(curl -s "https://zenodo.org/api/records/?q=conceptdoi:${CONCEPT}&sort=mostrecent&size=1" \
-                     | jq -r '.hits.hits[0].doi // empty')
-            if [ -n "$LATEST" ]; then
-              jq --arg v "$LATEST" '. + {zenodo_latest_doi:$v}' _render_context.json > _ctx.json && mv _ctx.json _render_context.json
-              echo "Latest DOI: $LATEST"
-            else
-              echo "No latest DOI found. Continue."
-            fi
-          else
-            echo "No concept DOI. Skip fetching latest DOI."
-          fi
+  env:
+    CONCEPT: ${{ inputs.concept_doi }}
+  run: |
+    set -euo pipefail
+
+    # 没传 concept DOI 就直接跳过
+    if [ -z "${CONCEPT:-}" ]; then
+      echo "No concept DOI provided; skip."
+      exit 0
+    fi
+
+    RESP=$(mktemp)
+    STATUS=$(curl -sS -L -H 'Accept: application/json' \
+      --retry 3 --retry-delay 2 --retry-connrefused \
+      -w '%{http_code}' -o "$RESP" \
+      "https://zenodo.org/api/records/?q=conceptdoi:${CONCEPT}&sort=mostrecent&size=1")
+
+    # 非 200（被限流/网络波动）——跳过，不失败
+    if [ "$STATUS" != "200" ]; then
+      echo "Zenodo API not 200 ($STATUS); skip latest DOI."
+      exit 0
+    fi
+
+    # 不是 JSON（偶发返回 HTML/空响应）——跳过，不失败
+    if ! head -c1 "$RESP" | grep -q '{'; then
+      echo "Response not JSON; skip."
+      exit 0
+    fi
+
+    # 解析最新版本 DOI；存在则写回渲染上下文
+    LATEST=$(jq -r '.hits.hits[0].doi // empty' < "$RESP")
+    if [ -n "$LATEST" ]; then
+      # 同时写入 zenodo_latest_doi，并覆盖 zenodo_concept_doi
+      jq --arg v "$LATEST" '.zenodo_concept_doi=$v | . + {zenodo_latest_doi:$v}' _render_context.json > _ctx.json && mv _ctx.json _render_context.json
+      echo "Latest DOI: $LATEST"
+    else
+      echo "JSON has no latest DOI; keep concept DOI."
+    fi
 
       - name: Render README from template + CONTENT.md
         run: |
