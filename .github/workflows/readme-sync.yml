@@ -1,14 +1,11 @@
-name: Reusable README Sync
+name: Reusable README Sync (minimal)
 
 on:
   workflow_call:
     inputs:
       concept_doi:
-        required: true
-        type: string
-    secrets:
-      ZENODO_TOKEN:
         required: false
+        type: string
 
 jobs:
   build:
@@ -30,58 +27,18 @@ jobs:
           import json, re
           from pathlib import Path
           from datetime import datetime
-
           root = Path('.')
           data = {}
           if (root/'links.json').exists():
               data = json.loads((root/'links.json').read_text('utf-8'))
-
-          # 时间戳
           data['last_updated'] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-
-          # OSF 短码（徽章）
           m = re.search(r'osf\.io/([a-z0-9]+)', data.get('osf_url',''), re.I)
           data['osf_slug'] = (m.group(1).upper() if m else 'RECORD')
-
           for k in ('title','subtitle','repo_url','zenodo_concept_doi'):
               data.setdefault(k, '')
-
           (root/'_render_context.json').write_text(json.dumps(data, ensure_ascii=False), 'utf-8')
           print("Context ready.")
           PY
-
-      - name: Fetch latest Zenodo version DOI (best-effort)
-        env:
-          CONCEPT: ${{ inputs.concept_doi }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CONCEPT:-}" ]; then
-            echo "No concept DOI provided; skip."
-            exit 0
-          fi
-          RESP=$(mktemp)
-          STATUS=$(curl -sS -L -H 'Accept: application/json' \
-            --retry 3 --retry-delay 2 --retry-connrefused \
-            -w '%{http_code}' -o "$RESP" \
-            "https://zenodo.org/api/records/?q=conceptdoi:${CONCEPT}&sort=mostrecent&size=1")
-
-          if [ "$STATUS" != "200" ]; then
-            echo "Zenodo API not 200 ($STATUS); skip latest DOI."
-            exit 0
-          fi
-
-          if ! head -c1 "$RESP" | grep -q '{'; then
-            echo "Response not JSON; skip."
-            exit 0
-          fi
-
-          LATEST=$(jq -r '.hits.hits[0].doi // empty' < "$RESP")
-          if [ -n "$LATEST" ]; then
-            jq --arg v "$LATEST" '.zenodo_concept_doi=$v | . + {zenodo_latest_doi:$v}' _render_context.json > _ctx.json && mv _ctx.json _render_context.json
-            echo "Latest DOI: $LATEST"
-          else
-            echo "JSON has no latest DOI; keep concept DOI."
-          fi
 
       - name: Render README from template + CONTENT.md
         run: |
@@ -93,12 +50,10 @@ jobs:
           tpl = (root/'README.tpl.md').read_text('utf-8') if (root/'README.tpl.md').exists() else ""
           custom = (root/'CONTENT.md').read_text('utf-8') if (root/'CONTENT.md').exists() else ""
           ctx['custom_content'] = custom
-
           def render(t, kv):
               for k,v in kv.items():
                   t = re.sub(r"{{\s*"+re.escape(k)+r"\s*}}", v if v is not None else '', t)
               return t
-
           (root/'README.md').write_text(render(tpl, ctx), 'utf-8')
           print("README.md updated.")
           PY
