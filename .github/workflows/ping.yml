@@ -1,0 +1,9 @@
+name: Reusable Ping
+on:
+  workflow_call:
+
+jobs:
+  pong:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "pong from reusable wf"
